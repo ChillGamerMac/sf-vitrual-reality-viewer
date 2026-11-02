@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sketchfab VR Viewer</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#f4f4f2;--fg:#1c1c1a;--card:#fff;--accent:#2a6df4;--line:#d8d8d4}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17181a;--fg:#ececea;--card:#232427;--accent:#6c9bff;--line:#3a3b3f}}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+canvas{display:block}
+#ui{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 24px;width:min(92vw,460px);text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.15)}
+h1{font-size:18px;margin:0 0 8px}
+p{font-size:14px;line-height:1.45;margin:6px 0;opacity:.85}
+input[type=text],input[type=password]{width:100%;box-sizing:border-box;margin:5px 0;padding:10px;border-radius:10px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:15px}
+button,label.btn{display:inline-block;margin:6px 4px 0;padding:10px 16px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg);font-size:15px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+#msg{font-size:13px;min-height:18px;word-break:break-word}
+#credit{font-size:12px;opacity:.7}
+input[type=file]{display:none}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Sketchfab VR Viewer</h1>
+  <input id="link" type="text" placeholder="Paste a Sketchfab model link or ID">
+  <input id="token" type="password" placeholder="Sketchfab API token (saved in this browser)">
+  <button id="paste">Paste &amp; load</button>
+  <button id="size">Size: Tabletop</button>
+  <button id="go">Load model</button>
+  <label class="btn" for="file">Load GLB file…</label><input id="file" type="file" accept=".glb">
+  <button id="vr" class="primary">Enter VR</button>
+  <p id="msg"></p>
+  <p id="credit"></p>
+  <p style="font-size:12px">Only models with downloads enabled can be loaded. Token: sketchfab.com → Settings → Password &amp; API.</p>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script>
+(function(){
+const $=id=>document.getElementById(id), msg=$('msg'), ui=$('ui');
+const renderer=new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.xr.enabled=true;
+document.body.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x1b1d22);
+const camera=new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.05,200);
+const dolly=new THREE.Group(); dolly.add(camera); scene.add(dolly);
+camera.position.set(0,1.6,0); dolly.position.set(0,0,2.2);
+
+scene.add(new THREE.HemisphereLight(0xffffff,0x444455,1.0));
+const sun=new THREE.DirectionalLight(0xffffff,1.0); sun.position.set(3,6,4); scene.add(sun);
+scene.add(new THREE.GridHelper(40,80,0x555a66,0x33363d));
+const floor=new THREE.Mesh(new THREE.CircleGeometry(20,48).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0x22252b,transparent:true,opacity:.6}));
+floor.position.y=-0.002; scene.add(floor);
+
+// ---- model ----
+const pivot=new THREE.Group(); pivot.position.set(0,1.2,-0.5); scene.add(pivot);
+let content=null;
+let mixer=null, mode='tabletop', contentH=1, clips=[], clipIdx=0, current=null, paused=false;
+function applyMode(){
+  let k=1;
+  if(mode==='life'){k=1.7/contentH;pivot.position.set(0,0.85,0.2);}   // about 1.7 m tall, feet on the floor, 2 m ahead
+  else pivot.position.set(0,1.2,-0.5);
+  pivot.scale.setScalar(k); pivot.rotation.set(0,0,0);
+}
+function toggleMode(){
+  mode=mode==='life'?'tabletop':'life'; applyMode();
+  $('size').textContent=mode==='life'?'Size: Life-size':'Size: Tabletop';
+}
+$('size').onclick=toggleMode;
+function playClip(i){
+  if(!clips.length||!mixer) return;
+  clipIdx=(i+clips.length)%clips.length;
+  const next=mixer.clipAction(clips[clipIdx]);
+  if(current&&current!==next) current.fadeOut(0.3);
+  next.reset().fadeIn(0.3).play(); current=next;
+}
+function nextClip(){ if(clips.length>1) playClip(clipIdx+1); flash(); }
+function togglePause(){ if(clips.length&&mixer){paused=!paused;mixer.timeScale=paused?0:1;} flash(); }
+function setContent(obj,anims){
+  if(content) pivot.remove(content);
+  mixer=null; clips=anims||[]; current=null; paused=false;
+  const box=new THREE.Box3().setFromObject(obj), size=box.getSize(new THREE.Vector3()), c=box.getCenter(new THREE.Vector3());
+  const s=1/(Math.max(size.x,size.y,size.z)||1);
+  obj.scale.multiplyScalar(s); obj.position.sub(c.multiplyScalar(s));
+  content=new THREE.Group(); content.add(obj); pivot.add(content);
+  contentH=(size.y*s)||1;
+  if(clips.length){mixer=new THREE.AnimationMixer(obj);playClip(0);}
+  drawPanel();
+  applyMode();
+}
+setContent(new THREE.Mesh(new THREE.TorusKnotGeometry(.4,.14,160,24),new THREE.MeshStandardMaterial({color:0x6c9bff,metalness:.3,roughness:.35})));
+
+// ---- loading ----
+const parseGLB=buf=>new Promise((res,rej)=>new THREE.GLTFLoader().parse(buf,'',g=>res(g),rej));
+async function parseZip(buf){
+  const zip=await JSZip.loadAsync(buf), urls={};
+  let main=null;
+  for(const name of Object.keys(zip.files)){
+    const f=zip.files[name]; if(f.dir) continue;
+    const lower=name.toLowerCase();
+    if(lower.endsWith('.gltf')&&!main) main=name;
+    const blob=await f.async('blob'), url=URL.createObjectURL(blob);
+    urls[lower]=url; urls[lower.split('/').pop()]=url;
+  }
+  if(!main) throw new Error('No .gltf inside the download');
+  const text=await zip.files[main].async('string');
+  const mgr=new THREE.LoadingManager();
+  mgr.setURLModifier(u=>{
+    let k=decodeURIComponent(u).replace(/^\.\//,'').toLowerCase();
+    return urls[k]||urls[k.split('/').pop()]||u;
+  });
+  return new Promise((res,rej)=>new THREE.GLTFLoader(mgr).parse(text,'',g=>res(g),rej));
+}
+async function loadSketchfab(input,token){
+  const m=String(input).match(/[0-9a-f]{32}/i);
+  if(!m) throw new Error('Could not find a model ID in that link.');
+  const uid=m[0].toLowerCase(), H={headers:{Authorization:'Token '+token}};
+  $('credit').textContent='';
+  msg.textContent='Asking Sketchfab for the download…';
+  const r=await fetch('https://api.sketchfab.com/v3/models/'+uid+'/download',H);
+  if(r.status===401) throw new Error('Token rejected. Check your API token.');
+  if(r.status===403) throw new Error('This model is not downloadable.');
+  if(!r.ok) throw new Error('Sketchfab returned '+r.status+'.');
+  const d=await r.json();
+  fetch('https://api.sketchfab.com/v3/models/'+uid).then(x=>x.json()).then(i=>{
+    $('credit').textContent='“'+i.name+'” by '+(i.user&&i.user.displayName)+(i.license?' ('+i.license.label+')':'');
+  }).catch(()=>{});
+  const pick=d.glb||d.gltf; if(!pick) throw new Error('No glTF/GLB download offered.');
+  msg.textContent='Downloading'+(pick.size?' ('+(pick.size/1048576).toFixed(1)+' MB)':'')+'…';
+  let buf;
+  try{ buf=await (await fetch(pick.url)).arrayBuffer(); }
+  catch(e){ throw new Error('The download was blocked (likely CORS). Download the GLB manually and use “Load GLB file”.'); }
+  msg.textContent='Building model…';
+  const g=d.glb?await parseGLB(buf):await parseZip(buf);
+  setContent(g.scene,g.animations);
+  msg.textContent='Model ready. Tap Enter VR.';
+}
+function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null;}}
+$('token').value=store('sfToken')||'';
+$('go').onclick=async()=>{
+  const t=$('token').value.trim(); if(!t){msg.textContent='Enter your API token first.';return;}
+  store('sfToken',t);
+  try{await loadSketchfab($('link').value,t);}catch(e){msg.textContent=e.message;}
+};
+$('paste').onclick=async()=>{
+  try{
+    const t=await navigator.clipboard.readText();
+    if(!/[0-9a-f]{32}/i.test(t)){msg.textContent='The clipboard has no Sketchfab model link. Copy the page address on Sketchfab first.';return;}
+    $('link').value=t.trim();
+    $('go').click();
+  }catch(e){msg.textContent='Clipboard access was blocked. Paste the link into the box manually.';}
+};
+$('file').onchange=e=>{
+  const f=e.target.files[0]; if(!f) return; msg.textContent='Loading…';
+  f.arrayBuffer().then(parseGLB).then(g=>{setContent(g.scene,g.animations);msg.textContent='Loaded '+f.name;}).catch(()=>msg.textContent='Could not read that file.');
+};
+// ?model=<id or link> auto-loads when a token is saved
+const q=new URLSearchParams(location.search).get('model');
+if(q){ $('link').value=q; if($('token').value) $('go').click(); else msg.textContent='Enter your token once, then tap Load model.'; }
+
+// ---- help panel (redrawn when the animation state changes) ----
+var panel=null, panelCv=null, panelTex=null, panelTimer=null, panelAuto=false;
+function drawPanel(){
+  if(!panelCv) return;
+  const g=panelCv.getContext('2d');
+  g.fillStyle='rgba(20,22,26,0.94)'; g.fillRect(0,0,1024,720);
+  g.strokeStyle='#6c9bff'; g.lineWidth=6; g.strokeRect(3,3,1018,714);
+  g.fillStyle='#fff'; g.font='bold 52px sans-serif'; g.fillText('Controls',40,86);
+  g.font='32px sans-serif';
+  ['Trigger (hold, aim at floor, release): jump there','Thumbstick up / down: scale  |  left / right: rotate','Grip (hold): grab and move the model','Left stick click: tabletop / life-size (resets)','Right stick click: next animation','A: pause / play animation','X: show or hide this help','B / Y: exit VR'].forEach((t,i)=>g.fillText(t,40,150+i*58));
+  const nm=clips.length?String(clips[clipIdx].name||'clip').slice(0,32):'';
+  const st=clips.length?'Animation '+(clipIdx+1)+'/'+clips.length+': '+nm+(paused?' (paused)':''):'No animations in this model';
+  g.fillStyle='#6c9bff'; g.font='bold 34px sans-serif'; g.fillText(st,40,670);
+  panelTex.needsUpdate=true;
+}
+function makePanel(){
+  panelCv=document.createElement('canvas'); panelCv.width=1024; panelCv.height=720;
+  panelTex=new THREE.CanvasTexture(panelCv);
+  panel=new THREE.Mesh(new THREE.PlaneGeometry(1.2,0.84),new THREE.MeshBasicMaterial({map:panelTex,transparent:true}));
+  panel.visible=false; scene.add(panel); drawPanel();
+}
+makePanel();
+function placePanel(){
+  const cam=renderer.xr.getCamera(camera), p=new THREE.Vector3(), d=new THREE.Vector3();
+  cam.getWorldPosition(p); cam.getWorldDirection(d); d.y=0; d.normalize();
+  panel.position.copy(p).addScaledVector(d,1.3); panel.position.y=p.y-0.05;
+  panel.lookAt(p.x,panel.position.y,p.z); panel.visible=true;
+}
+function togglePanel(){
+  clearTimeout(panelTimer); panelAuto=false;
+  if(panel.visible){panel.visible=false;return;}
+  placePanel();
+}
+function flash(){   // briefly show the panel so the new animation state is visible
+  drawPanel();
+  if(panel.visible&&!panelAuto) return;
+  panelAuto=true; placePanel(); clearTimeout(panelTimer);
+  panelTimer=setTimeout(()=>{panel.visible=false;panelAuto=false;},2500);
+}
+
+// ---- controllers & teleport ----
+const marker=new THREE.Mesh(new THREE.RingGeometry(.15,.2,32).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0x6c9bff}));
+marker.visible=false; scene.add(marker);
+const plane=new THREE.Plane(new THREE.Vector3(0,1,0),0);
+const ray=new THREE.Raycaster(), tmpM=new THREE.Matrix4(), hit=new THREE.Vector3(), aiming=new Set();
+let grab=null; const p0=new THREE.Vector3(), pivot0=new THREE.Vector3(), tmpV=new THREE.Vector3();
+function floorHit(c){
+  tmpM.identity().extractRotation(c.matrixWorld);
+  ray.ray.origin.setFromMatrixPosition(c.matrixWorld);
+  ray.ray.direction.set(0,0,-1).applyMatrix4(tmpM);
+  return ray.ray.intersectPlane(plane,hit)&&hit.distanceTo(ray.ray.origin)<30?hit:null;
+}
+for(let i=0;i<2;i++){
+  const c=renderer.xr.getController(i);
+  const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(),new THREE.Vector3(0,0,-1)]),new THREE.LineBasicMaterial({color:0xffffff}));
+  line.scale.z=3; c.add(line);
+  c.add(new THREE.Mesh(new THREE.SphereGeometry(.015),new THREE.MeshBasicMaterial({color:0x6c9bff})));
+  c.addEventListener('selectstart',()=>aiming.add(c));
+  c.addEventListener('selectend',()=>{aiming.delete(c);const h=floorHit(c);if(h){dolly.position.x=h.x-camera.position.x;dolly.position.z=h.z-camera.position.z;}});
+  c.addEventListener('squeezestart',()=>{grab=c;p0.setFromMatrixPosition(c.matrixWorld);pivot0.copy(pivot.position);});
+  c.addEventListener('squeezeend',()=>{if(grab===c)grab=null;});
+  dolly.add(c);
+}
+
+// ---- VR session ----
+const vrBtn=$('vr');
+(async()=>{
+  if(!navigator.xr||!(await navigator.xr.isSessionSupported('immersive-vr').catch(()=>false))){
+    vrBtn.disabled=true; vrBtn.textContent='VR not available';
+  }
+})();
+vrBtn.onclick=async()=>{
+  let step='requesting the VR session';
+  try{
+    const tries=[{optionalFeatures:['local-floor']},{}];
+    let s=null,last=null;
+    for(const o of tries){
+      try{s=await navigator.xr.requestSession('immersive-vr',o);break;}catch(e){last=e;}
+    }
+    if(!s) throw last;
+    const floor=s.enabledFeatures&&s.enabledFeatures.includes('local-floor');
+    renderer.xr.setReferenceSpaceType(floor?'local-floor':'local');
+    if(!floor) camera.position.set(0,0,0), dolly.position.y=1.6;
+    step='attaching the renderer';
+    await renderer.xr.setSession(s);
+    ui.style.display='none';
+    s.addEventListener('end',()=>{ui.style.display='';panel.visible=false;});
+    panel.visible=false; togglePanel();
+  }catch(e){msg.textContent='VR failed while '+step+' ('+(e.name||'Error')+': '+e.message+') on '+location.protocol+'//'+location.host+(window.top!==window?' [inside a frame]':'');}
+};
+
+// ---- frame loop ----
+const prev={}, clock=new THREE.Clock(), DZ=0.15;
+renderer.setAnimationLoop(()=>{
+  const dt=Math.min(clock.getDelta(),0.1), s=renderer.xr.getSession&&renderer.xr.getSession();
+  if(mixer) mixer.update(dt);
+  if(grab){ tmpV.setFromMatrixPosition(grab.matrixWorld); pivot.position.copy(pivot0).add(tmpV).sub(p0); }
+  if(s){
+    let sx=0,sy=0;
+    for(const src of s.inputSources){
+      const gp=src.gamepad; if(!gp) continue;
+      const a=gp.axes, x=a[2]!==undefined?a[2]:a[0], y=a[3]!==undefined?a[3]:a[1];
+      if(Math.abs(x)>Math.abs(sx)&&Math.abs(x)>DZ) sx=x;
+      if(Math.abs(y)>Math.abs(sy)&&Math.abs(y)>DZ) sy=y;
+      const b=gp.buttons, st=prev[src.handedness]||(prev[src.handedness]=[]);
+      const left=src.handedness==='left';
+      if(b[4]&&b[4].pressed&&!st[4]){ if(left) togglePanel(); else togglePause(); }
+      if(b[5]&&b[5].pressed&&!st[5]) s.end();
+      if(b[3]&&b[3].pressed&&!st[3]){ if(left) toggleMode(); else nextClip(); }   // thumbstick click
+      st[3]=b[3]&&b[3].pressed; st[4]=b[4]&&b[4].pressed; st[5]=b[5]&&b[5].pressed;
+    }
+    if(sx) pivot.rotation.y+=sx*dt*2.0;
+    if(sy){pivot.scale.multiplyScalar(Math.exp(-sy*dt*1.2));pivot.scale.clampScalar(0.02,60);}
+  }
+  marker.visible=false;
+  for(const c of aiming){const h=floorHit(c);if(h){marker.position.set(h.x,0.01,h.z);marker.visible=true;}}
+  renderer.render(scene,camera);
+});
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight);});
+})();
+</script>
+</body>
+</html>
